@@ -96,11 +96,11 @@ export default function SignupPage() {
     setLoading(true)
     
     // Simulate signup with realistic delay
-    setTimeout(() => {
-      login({ email: formData.email, name: formData.name })
-      router.push("/dashboard")
-      setLoading(false)
-    }, 1500)
+        setTimeout(() => {
+          // Redirect to login page after signup
+          router.push("/login")
+          setLoading(false)
+        }, 1500)
   }
 
   const getPasswordStrengthColor = () => {

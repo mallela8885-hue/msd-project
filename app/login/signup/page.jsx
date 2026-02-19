@@ -56,26 +56,9 @@ export default function SignupPage() {
         formData.name
       )
       
-      // Set user data
-      setUser({
-        id: response.user.id,
-        email: response.user.email,
-        name: response.user.name,
-        avatar: response.user.avatar,
-      })
-      setIsAuthenticated(true)
-      
-      // Redirect to dashboard
-      router.push("/dashboard")
+      // Redirect to login page after successful signup
+      router.push("/login")
     } catch (err) {
-      setError(err.message || "Signup failed. Please try again.")
-      setIsLoading(false)
-    }
-  }
-
-  function handleGoogleSignup() {
-    apiClient.startGoogleOAuth()
-  }
 
   function handleGitHubSignup() {
     apiClient.startGitHubOAuth()

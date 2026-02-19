@@ -30,4 +30,10 @@ router.get('/repositories/:owner/:repo/webhooks', authMiddleware, githubProvider
 // Create deployment webhook
 router.post('/repositories/:owner/:repo/webhooks/deployment', authMiddleware, githubProviderController.createDeploymentWebhook);
 
+// Import repository and create project
+router.post('/import', authMiddleware, githubProviderController.importRepository);
+
+// Handle GitHub webhook for auto-deploy
+router.post('/webhook/:projectId', githubProviderController.handleGitHubWebhook);
+
 module.exports = router;

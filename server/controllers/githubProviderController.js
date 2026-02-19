@@ -416,6 +416,174 @@ class GitHubProviderController {
       });
     }
   }
+
+  // Import repository and create project with auto-deploy
+  static async importRepository(req, res) {
+    try {
+      const userId = req.user._id;
+      const { repoFullName, branch, framework, buildCommand, outputDirectory, environmentVariables } = req.body;
+      const Project = require('../models/Project');
+      const deploymentService = require('../services/deploymentService');
+      const crypto = require('crypto');
+
+      const integration = await GitHubIntegration.findOne({ userId });
+      if (!integration) {
+        return res.status(404).json({ error: 'GitHub not connected' });
+      }
+
+      const [owner, repo] = repoFullName.split('/');
+
+      // Get repository details
+      const repoResponse = await axios.get(`${GITHUB_API_BASE}/repos/${owner}/${repo}`, {
+        headers: {
+          Authorization: `Bearer ${integration.accessToken}`,
+          Accept: 'application/vnd.github.v3+json',
+        },
+      });
+
+      const repoData = repoResponse.data;
+
+      // Create project
+      const project = new Project({
+        name: repo,
+        userId,
+        framework: framework || 'nextjs',
+        repository: {
+          provider: 'github',
+          url: repoData.clone_url,
+          owner,
+          name: repo,
+          branch: branch || repoData.default_branch,
+          fullName: repoFullName,
+          isPrivate: repoData.private,
+        },
+        buildSettings: {
+          buildCommand: buildCommand || 'npm run build',
+          outputDirectory: outputDirectory || 'out',
+          installCommand: 'npm install',
+        },
+        environmentVariables: environmentVariables || [],
+        autoDeployEnabled: true,
+        status: 'active',
+      });
+
+      await project.save();
+
+      // Setup webhook for auto-deploy
+      const webhookUrl = `${process.env.API_URL}/api/webhooks/github/${project._id}`;
+      const webhookSecret = crypto.randomBytes(32).toString('hex');
+
+      try {
+        const webhookResponse = await axios.post(
+          `${GITHUB_API_BASE}/repos/${owner}/${repo}/hooks`,
+          {
+            name: 'web',
+            active: true,
+            events: ['push', 'pull_request'],
+            config: {
+              url: webhookUrl,
+              content_type: 'json',
+              secret: webhookSecret,
+              insecure_ssl: '0',
+            },
+          },
+          {
+            headers: {
+              Authorization: `Bearer ${integration.accessToken}`,
+              Accept: 'application/vnd.github.v3+json',
+            },
+          }
+        );
+
+        project.repository.webhookId = webhookResponse.data.id;
+        project.repository.webhookSecret = webhookSecret;
+        await project.save();
+      } catch (webhookError) {
+        console.error('Failed to create webhook:', webhookError.response?.data);
+      }
+
+      // Trigger initial deployment
+      const deployment = await deploymentService.createDeployment({
+        projectId: project._id,
+        gitCommit: repoData.default_branch,
+        gitBranch: branch || repoData.default_branch,
+        gitAuthor: req.user.name,
+        commitMessage: 'Initial deployment',
+        environment: 'production',
+      });
+
+      res.status(201).json({
+        project,
+        deployment,
+        message: 'Repository imported successfully',
+      });
+    } catch (error) {
+      console.error('Import repository error:', error.response?.data || error.message);
+      res.status(error.response?.status || 500).json({
+        error: error.response?.data?.message || 'Failed to import repository',
+      });
+    }
+  }
+
+  // Handle GitHub webhook for auto-deploy
+  static async handleGitHubWebhook(req, res) {
+    try {
+      const { projectId } = req.params;
+      const signature = req.headers['x-hub-signature-256'];
+      const payload = req.body;
+      const Project = require('../models/Project');
+      const deploymentService = require('../services/deploymentService');
+      const crypto = require('crypto');
+
+      const project = await Project.findById(projectId);
+      if (!project || !project.repository) {
+        return res.status(404).json({ error: 'Project not found' });
+      }
+
+      // Verify webhook signature
+      if (project.repository.webhookSecret) {
+        const hmac = crypto.createHmac('sha256', project.repository.webhookSecret);
+        const digest = 'sha256=' + hmac.update(JSON.stringify(payload)).digest('hex');
+        
+        if (signature !== digest) {
+          return res.status(401).json({ error: 'Invalid signature' });
+        }
+      }
+
+      // Handle push event
+      if (payload.ref && payload.ref.includes(project.repository.branch)) {
+        const deployment = await deploymentService.createDeployment({
+          projectId: project._id,
+          gitCommit: payload.after,
+          gitBranch: payload.ref.replace('refs/heads/', ''),
+          gitAuthor: payload.pusher?.name || 'unknown',
+          commitMessage: payload.head_commit?.message || 'No message',
+          environment: 'production',
+        });
+
+        return res.status(202).json({ deployment, message: 'Deployment triggered' });
+      }
+
+      // Handle pull request event
+      if (payload.pull_request && (payload.action === 'opened' || payload.action === 'synchronize')) {
+        const deployment = await deploymentService.createDeployment({
+          projectId: project._id,
+          gitCommit: payload.pull_request.head.sha,
+          gitBranch: payload.pull_request.head.ref,
+          gitAuthor: payload.pull_request.user.login,
+          commitMessage: payload.pull_request.title,
+          environment: 'preview',
+        });
+
+        return res.status(202).json({ deployment, message: 'Preview deployment triggered' });
+      }
+
+      res.json({ message: 'Webhook received' });
+    } catch (error) {
+      console.error('Webhook error:', error.message);
+      res.status(500).json({ error: 'Webhook processing failed' });
+    }
+  }
 }
 
 module.exports = GitHubProviderController;
