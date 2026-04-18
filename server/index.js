@@ -42,6 +42,9 @@ const uptimeRoutes = require("./routes/uptime")
 const reportsRoutes = require("./routes/reports")
 const githubProviderRoutes = require("./routes/github-provider")
 const billingRoutes = require("./routes/billing")
+const nodesRoutes = require("./routes/nodes")
+const jobsRoutes = require("./routes/jobs")
+const portsRoutes = require("./routes/ports")
 
 const app = express()
 
@@ -144,6 +147,11 @@ app.use("/api/uptime", uptimeRoutes)
 app.use("/api/reports", reportsRoutes)
 app.use("/api/github-provider", githubProviderRoutes)
 app.use("/api/billing", billingRoutes)
+
+// PaaS Infrastructure Routes
+app.use("/api/nodes", nodesRoutes)
+app.use("/api/jobs", jobsRoutes)
+app.use("/api/ports", portsRoutes)
 
 // Error handling
 app.use(errorHandler)

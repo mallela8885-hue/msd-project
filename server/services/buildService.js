@@ -1,11 +1,12 @@
 const mongoose = require('mongoose');
 const Build = require('../models/Build');
 const Project = require('../models/Project');
-const { spawn } = require('child_process');
+const { spawn, exec } = require('child_process');
 const fs = require('fs').promises;
 const path = require('path');
 const archiver = require('archiver');
 const crypto = require('crypto');
+const dockerfileGenerator = require('./dockerfileGenerator');
 
 class BuildService {
     constructor() {
@@ -55,36 +56,14 @@ class BuildService {
         if (!build) throw new Error('Build not found');
 
         try {
-            await this.updateBuildStatus(buildId, 'cloning');
-            
-            // Clone repository
-            const workspaceDir = await this.cloneRepository(build);
-            
-            await this.updateBuildStatus(buildId, 'installing');
-            
-            // Install dependencies
-            await this.installDependencies(build, workspaceDir);
-            
-            await this.updateBuildStatus(buildId, 'building');
-            
-            // Run build
-            const buildResult = await this.runBuild(build, workspaceDir);
-            
-            await this.updateBuildStatus(buildId, 'packaging');
-            
-            // Package artifacts
-            const artifacts = await this.packageArtifacts(build, workspaceDir, buildResult);
-            
-            await this.updateBuildStatus(buildId, 'success', {
-                artifacts,
-                endTime: new Date(),
-                duration: Date.now() - build.startTime.getTime(),
-                buildSize: artifacts.reduce((sum, a) => sum + (a.size || 0), 0)
-            });
-
-            // Cleanup workspace
-            await this.cleanupWorkspace(workspaceDir);
-
+            // Check if Docker build is enabled
+            if (build.buildConfig.useDocker && process.env.DOCKER_ENABLED === 'true') {
+                console.log(`[v0] Using Docker execution for build ${buildId}`);
+                await this.dockerBuild(build);
+            } else {
+                // Use traditional build process
+                await this.traditionalBuild(build, buildId);
+            }
         } catch (error) {
             await this.updateBuildStatus(buildId, 'failed', {
                 error: error.message,
@@ -95,6 +74,232 @@ class BuildService {
         } finally {
             this.activeBuildProcesses.delete(buildId);
         }
+    }
+
+    async traditionalBuild(build, buildId) {
+        const buildId_ = build._id;
+        const workspaceDir = await this.cloneRepository(build);
+        
+        await this.updateBuildStatus(buildId_, 'installing');
+        
+        // Install dependencies
+        await this.installDependencies(build, workspaceDir);
+        
+        await this.updateBuildStatus(buildId_, 'building');
+        
+        // Run build
+        const buildResult = await this.runBuild(build, workspaceDir);
+        
+        await this.updateBuildStatus(buildId_, 'packaging');
+        
+        // Package artifacts
+        const artifacts = await this.packageArtifacts(build, workspaceDir, buildResult);
+        
+        await this.updateBuildStatus(buildId_, 'success', {
+            artifacts,
+            endTime: new Date(),
+            duration: Date.now() - build.startTime.getTime(),
+            buildSize: artifacts.reduce((sum, a) => sum + (a.size || 0), 0)
+        });
+
+        // Cleanup workspace
+        await this.cleanupWorkspace(workspaceDir);
+    }
+
+    async dockerBuild(build) {
+        const buildId = build._id;
+        const workspaceDir = await this.cloneRepository(build);
+
+        try {
+            await this.updateBuildStatus(buildId, 'dockerfile_generation');
+            
+            // Generate Dockerfile
+            const dockerfile = await dockerfileGenerator.generateDockerfile(
+                workspaceDir,
+                build.buildConfig
+            );
+            
+            // Write Dockerfile to workspace
+            const dockerfilePath = path.join(workspaceDir, 'Dockerfile');
+            await fs.writeFile(dockerfilePath, dockerfile);
+
+            // Write nginx.conf for SPA projects if needed
+            const nginxConfig = dockerfileGenerator.generateNginxConfig();
+            const nginxPath = path.join(workspaceDir, 'nginx.conf');
+            await fs.writeFile(nginxPath, nginxConfig);
+
+            await this.updateBuildStatus(buildId, 'docker_building');
+            
+            // Build Docker image
+            const imageName = `msd-build-${build.projectId._id.toString().slice(-8)}-${buildId.toString().slice(-8)}`;
+            const imageTag = `${imageName}:${build.commitSha?.slice(0, 7) || 'latest'}`;
+            
+            await this.buildDockerImage(buildId, workspaceDir, imageTag);
+
+            await this.updateBuildStatus(buildId, 'docker_running');
+            
+            // Run container and capture output
+            const container = await this.runDockerContainer(buildId, imageTag, workspaceDir);
+            
+            await this.updateBuildStatus(buildId, 'packaging');
+            
+            // Package artifacts from container output directory
+            const artifacts = await this.packageDockerArtifacts(build, imageTag, workspaceDir);
+            
+            await this.updateBuildStatus(buildId, 'success', {
+                artifacts,
+                endTime: new Date(),
+                duration: Date.now() - build.startTime.getTime(),
+                buildSize: artifacts.reduce((sum, a) => sum + (a.size || 0), 0),
+                executionMethod: 'docker',
+                imageName: imageTag
+            });
+
+            // Cleanup Docker resources
+            await this.cleanupDockerResources(imageTag);
+
+        } catch (error) {
+            await this.addBuildLog(buildId, `Docker build error: ${error.message}`, 'error');
+            // Cleanup on error
+            try {
+                await this.cleanupDockerResources(`msd-build-*`);
+            } catch (cleanupError) {
+                console.error('[v0] Cleanup error:', cleanupError);
+            }
+            throw error;
+        } finally {
+            await this.cleanupWorkspace(workspaceDir);
+        }
+    }
+
+    async buildDockerImage(buildId, workspaceDir, imageTag) {
+        return new Promise((resolve, reject) => {
+            const dockerCmd = `docker build -t ${imageTag} --memory=256m --memory-swap=256m .`;
+            
+            const process = spawn('docker', ['build', '-t', imageTag, '--memory=256m', '--memory-swap=256m', '.'], {
+                cwd: workspaceDir,
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+
+            let output = '';
+
+            process.stdout.on('data', (data) => {
+                const message = data.toString();
+                output += message;
+                this.addBuildLog(buildId, message.trim(), 'info');
+            });
+
+            process.stderr.on('data', (data) => {
+                const message = data.toString();
+                output += message;
+                this.addBuildLog(buildId, message.trim(), 'error');
+            });
+
+            process.on('close', (code) => {
+                if (code === 0) {
+                    console.log(`[v0] Docker image built successfully: ${imageTag}`);
+                    resolve({ output, code });
+                } else {
+                    reject(new Error(`Docker build failed with code ${code}`));
+                }
+            });
+
+            process.on('error', reject);
+        });
+    }
+
+    async runDockerContainer(buildId, imageTag, workspaceDir) {
+        return new Promise((resolve, reject) => {
+            const containerName = `build-${buildId.toString().slice(-8)}`;
+            
+            // Run container with environment variables and memory limits
+            const dockerArgs = [
+                'run',
+                '--rm',
+                '--name', containerName,
+                '--memory=256m',
+                '--cpus=0.5',
+                '-e', 'NODE_ENV=production',
+                imageTag
+            ];
+
+            const process = spawn('docker', dockerArgs, {
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+
+            let output = '';
+
+            process.stdout.on('data', (data) => {
+                const message = data.toString();
+                output += message;
+                this.addBuildLog(buildId, message.trim(), 'info');
+            });
+
+            process.stderr.on('data', (data) => {
+                const message = data.toString();
+                output += message;
+                this.addBuildLog(buildId, message.trim(), 'error');
+            });
+
+            process.on('close', (code) => {
+                if (code === 0) {
+                    resolve({ containerName, output, code });
+                } else {
+                    reject(new Error(`Docker run failed with code ${code}`));
+                }
+            });
+
+            process.on('error', reject);
+        });
+    }
+
+    async packageDockerArtifacts(build, imageTag, workspaceDir) {
+        const artifacts = [];
+        const artifactsDir = path.join(process.cwd(), 'storage', 'artifacts', build._id.toString());
+        
+        await fs.mkdir(artifactsDir, { recursive: true });
+
+        // For Docker builds, we primarily care about the build metadata
+        const buildMetadata = {
+            type: 'docker-build',
+            imageTag,
+            timestamp: new Date(),
+            projectId: build.projectId._id,
+            commitSha: build.commitSha,
+            outputDirectory: build.buildConfig.outputDirectory || 'dist'
+        };
+
+        // Create a manifest file with build information
+        const manifestPath = path.join(artifactsDir, 'manifest.json');
+        await fs.writeFile(manifestPath, JSON.stringify(buildMetadata, null, 2));
+
+        const stats = await fs.stat(manifestPath);
+        artifacts.push({
+            type: 'manifest',
+            path: manifestPath,
+            size: stats.size,
+            hash: await this.calculateFileHash(manifestPath),
+            createdAt: new Date()
+        });
+
+        return artifacts;
+    }
+
+    async cleanupDockerResources(imageTag) {
+        return new Promise((resolve) => {
+            // Remove Docker image
+            const process = spawn('docker', ['rmi', imageTag]);
+            
+            process.on('close', () => {
+                console.log(`[v0] Cleaned up Docker image: ${imageTag}`);
+                resolve();
+            });
+
+            process.on('error', (error) => {
+                console.warn('[v0] Error cleaning up Docker image:', error.message);
+                resolve(); // Don't fail on cleanup errors
+            });
+        });
     }
 
     async cloneRepository(build) {
