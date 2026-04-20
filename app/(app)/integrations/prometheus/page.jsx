@@ -44,7 +44,7 @@ export default function PrometheusIntegrationPage() {
       instance: 'localhost:9090',
       state: 'up',
       labels: { group: 'monitoring', env: 'production' },
-      scrapeUrl: 'http://localhost:9090/metrics',
+      scrapeUrl: process.env.NEXT_PUBLIC_PROMETHEUS_URL + '/metrics',
       interval: '15s',
       timeout: '10s',
       lastScrape: '2024-12-20T16:02:00Z',
