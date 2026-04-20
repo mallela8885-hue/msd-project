@@ -4,6 +4,7 @@ import { useEffect, useCallback } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { useAppStore } from "@/store/use-app-store"
 import apiClient from "@/lib/api-client"
+import tokenService from "@/lib/token-service"
 
 export default function AuthCallbackPage() {
   const router = useRouter()
@@ -28,18 +29,26 @@ export default function AuthCallbackPage() {
         return
       }
 
-      // Store tokens
+      // Store tokens using token service for secure handling
+      tokenService.setAccessToken(token)
+      tokenService.setRefreshToken(refreshToken)
+      
+      // Also set in API client for immediate use
       apiClient.setToken(token)
       apiClient.setRefreshToken(refreshToken)
 
-      // Set user data in store
-      setUser({
+      // Store user data
+      const userData = {
         id: userId,
         email,
         name,
         avatar: avatar || null,
         provider,
-      })
+      }
+      tokenService.setUser(userData)
+
+      // Set user data in store
+      setUser(userData)
       setIsAuthenticated(true)
 
       // Show welcome message if new user

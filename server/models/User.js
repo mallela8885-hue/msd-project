@@ -120,4 +120,57 @@ userSchema.methods.resetLoginAttempts = async function () {
   })
 }
 
+// Static method - Find user by email (case-insensitive)
+userSchema.statics.findByEmail = function (email) {
+  return this.findOne({ email: email.toLowerCase() })
+}
+
+// Static method - Find user by provider ID
+userSchema.statics.findByGoogleId = function (googleId) {
+  return this.findOne({ "oauth.google.id": googleId })
+}
+
+userSchema.statics.findByGithubId = function (githubId) {
+  return this.findOne({ "oauth.github.id": githubId })
+}
+
+// Instance method - Check if provider is linked
+userSchema.methods.hasProvider = function (provider) {
+  if (provider === "google") {
+    return !!(this.oauth?.google?.id)
+  }
+  if (provider === "github") {
+    return !!(this.oauth?.github?.id)
+  }
+  return false
+}
+
+// Instance method - Get all linked providers
+userSchema.methods.getLinkedProviders = function () {
+  const providers = []
+  if (this.password) providers.push("local")
+  if (this.oauth?.google?.id) providers.push("google")
+  if (this.oauth?.github?.id) providers.push("github")
+  return providers
+}
+
+// Instance method - Link provider to existing user
+userSchema.methods.linkProvider = function (provider, providerData) {
+  if (provider === "google") {
+    this.oauth.google = {
+      id: providerData.id,
+      email: providerData.email,
+      picture: providerData.picture,
+      refreshToken: providerData.refreshToken,
+    }
+  } else if (provider === "github") {
+    this.oauth.github = {
+      id: providerData.id,
+      login: providerData.login,
+      avatar_url: providerData.avatar_url,
+      accessToken: providerData.accessToken,
+    }
+  }
+}
+
 module.exports = mongoose.models.User || mongoose.model("User", userSchema)
